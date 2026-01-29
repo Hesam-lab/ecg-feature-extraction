@@ -54,12 +54,16 @@ def ECGfilter(raw, Fs=256):
 
     # Calculate RR intervals
     RR = np.diff(R) / Fs * 1000  # RR intervals in milliseconds
+    total_intervals = len(RR)
 
     # Detect outliers using MAD
     median_RR = np.median(RR)
     mad_RR = np.median(np.abs(RR - median_RR))
     threshold = 3  # MAD threshold (tunable)
     outlier_indices = np.where(np.abs(RR - median_RR) / (mad_RR + 1e-6) > threshold)[0]
+
+    # Calculate the percentage of removed IBIs
+    removal_percentage = (len(outlier_indices) / total_intervals) * 100 if total_intervals > 0 else 0
 
     # Remove outliers
     for idx in outlier_indices:
@@ -68,7 +72,7 @@ def ECGfilter(raw, Fs=256):
 
     # Remove NaN values
     ecg_clean = ecg_cleaned[~np.isnan(ecg_cleaned)]
-    return ecg_clean, ecg_signal
+    return ecg_clean, ecg_signal, removal_percentage
 
 
 def plot_ecg(raw_ecg, ecg_filtered, file, output_dir):
@@ -284,7 +288,7 @@ def process_data(edf_directory, output_dir):
             raw = mne.io.read_raw_edf(file_path, preload=True)
     
             try:
-                ecg_cleaned, ecg_raw = ECGfilter(raw, Fs=256)
+                ecg_cleaned, ecg_raw, removal_perc = ECGfilter(raw, Fs=256)
             except ValueError as e:
                 print(f"Skipping file {file} due to missing ECG channels: {e}")
                 continue
@@ -305,7 +309,8 @@ def process_data(edf_directory, output_dir):
             # Combine ECG features
             ecg_features = {
                 "morphology": morphology_features,
-                "hrv": hrv_features
+                "hrv": hrv_features,
+                "artifact_removal_rate": removal_perc
             }
             
             # Store features based on condition
@@ -330,3 +335,4 @@ def process_data(edf_directory, output_dir):
 edf_directory = "C:\\Path\\To\\EDF_Files"
 output_dir = "C:\\Path\\To\\Processed_Data"
 process_data(edf_directory, output_dir)
+
