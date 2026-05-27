@@ -1,338 +1,774 @@
-import os
+import argparse
 import json
-import numpy as np
-import mne
+import logging
 import math
-import neurokit2 as nk
-from scipy.signal import resample
 from collections import defaultdict
-from neurokit2.hrv.hrv_utils import _hrv_get_rri
+from pathlib import Path
 import matplotlib.pyplot as plt
+import mne
+import neurokit2 as nk
+import numpy as np
+import scipy.interpolate
+from scipy.signal import resample
+from tqdm import tqdm
 
-# Disable verbose logs
-mne.set_log_level('ERROR')
+
+mne.set_log_level("ERROR")
+
+FS = 256
+MIN_RPEAKS = 50
+
+logger = logging.getLogger(__name__)
 
 
-def ECGfilter(raw, Fs=256):
+def json_friendly(x):
+    """Convert numpy values to normal Python values before saving as JSON."""
+    if isinstance(x, dict):
+        return {k: json_friendly(v) for k, v in x.items()}
+
+    if isinstance(x, list):
+        return [json_friendly(v) for v in x]
+
+    if isinstance(x, tuple):
+        return [json_friendly(v) for v in x]
+
+    if isinstance(x, np.ndarray):
+        return json_friendly(x.tolist())
+
+    if isinstance(x, np.integer):
+        return int(x)
+
+    if isinstance(x, np.floating):
+        x = float(x)
+        return None if math.isnan(x) or math.isinf(x) else x
+
+    if isinstance(x, float):
+        return None if math.isnan(x) or math.isinf(x) else x
+
+    return x
+
+
+def get_ecg_channel(raw):
+    """Find the ECG channel in an MNE Raw object."""
+    ecg_channels = [
+        ch for ch in raw.ch_names
+        if "ecg" in ch.lower() or "ekg" in ch.lower()
+    ]
+
+    if len(ecg_channels) == 0:
+        raise ValueError(f"No ECG channel found. Available channels: {raw.ch_names}")
+
+    return ecg_channels[0]
+
+
+def clean_ecg(raw, fs=FS):
     """
-    Filters and cleans the ECG signal extracted from the EDF file.
-    
-    Parameters:
-    - raw: MNE Raw object containing the loaded data.
-    - Fs: Desired sampling frequency for the ECG signal (default: 256 Hz).
-    
-    Returns:
-    - ecg_clean: Filtered and cleaned ECG signal.
-    - ecg_signal: Raw ECG signal before cleaning.
+    Extract and clean ECG.
+
     """
+    ecg_channel = get_ecg_channel(raw)
+    ecg = raw.get_data(picks=[ecg_channel]).flatten()
 
-    # Extract ECG channels
-    if "ECG+" not in raw.ch_names or "ECG-" not in raw.ch_names:
-        raise ValueError("Missing ECG+ or ECG- channels in the dataset.")
-    
-    ecg_plus = raw.get_data(picks="ECG+").flatten()
-    ecg_minus = raw.get_data(picks="ECG-").flatten()
-    ecg_signal = ecg_minus - ecg_plus
+    original_fs = raw.info["sfreq"]
 
-    # Resample ECG to match the target sampling frequency
-    current_fs = raw.info['sfreq']
-    if current_fs != Fs:
-        num_samples = int(len(ecg_signal) * Fs / current_fs)
-        ecg_signal = resample(ecg_signal, num_samples)
+    if not np.isclose(original_fs, fs):
+        n_samples = int(round(len(ecg) * fs / original_fs))
+        ecg = resample(ecg, n_samples)
 
-    # Clean ECG using NeuroKit2
-    ecg_cleaned = nk.ecg_clean(ecg_signal, sampling_rate=Fs, method='biosppy')
+    ecg_clean = nk.ecg_clean(ecg, sampling_rate=fs, method="biosppy")
 
-    # Remove samples where amplitude does not exceed 1 µV (convert to µV for comparison)
-    ecg_cleaned_muV = ecg_cleaned * 1e6
-    valid_indices = np.where(np.abs(ecg_cleaned_muV) > 1)[0]
-    ecg_cleaned = ecg_cleaned[valid_indices]
+    info = {
+        "ecg_channel": ecg_channel,
+        "original_fs": float(original_fs),
+        "target_fs": fs,
+        "n_samples": len(ecg_clean),
+    }
 
-    # R-peak detection
-    _, info = nk.ecg_peaks(ecg_cleaned, sampling_rate=Fs, method='nabian2018')
-    R = info['ECG_R_Peaks']
-
-    # Calculate RR intervals
-    RR = np.diff(R) / Fs * 1000  # RR intervals in milliseconds
-    total_intervals = len(RR)
-
-    # Detect outliers using MAD
-    median_RR = np.median(RR)
-    mad_RR = np.median(np.abs(RR - median_RR))
-    threshold = 3  # MAD threshold (tunable)
-    outlier_indices = np.where(np.abs(RR - median_RR) / (mad_RR + 1e-6) > threshold)[0]
-
-    # Calculate the percentage of removed IBIs
-    removal_percentage = (len(outlier_indices) / total_intervals) * 100 if total_intervals > 0 else 0
-
-    # Remove outliers
-    for idx in outlier_indices:
-        a, b = R[idx], R[idx + 1]
-        ecg_cleaned[a:b + 1] = np.nan
-
-    # Remove NaN values
-    ecg_clean = ecg_cleaned[~np.isnan(ecg_cleaned)]
-    return ecg_clean, ecg_signal, removal_percentage
+    return ecg_clean, ecg, info
 
 
-def plot_ecg(raw_ecg, ecg_filtered, file, output_dir):
+def detect_rpeaks(ecg_clean, fs=FS):
+    """Detect R-peaks using NeuroKit2."""
+    _, rpeaks = nk.ecg_peaks(
+        ecg_clean,
+        sampling_rate=fs,
+        method="nabian2018"
+    )
+
+    rpeaks["ECG_R_Peaks"] = np.asarray(rpeaks["ECG_R_Peaks"], dtype=int)
+    rpeaks["sampling_rate"] = fs
+
+    return rpeaks
+
+
+def remove_bad_rpeaks(rpeaks, fs=FS, mad_threshold=3.0, min_rr_ms=300, max_rr_ms=2000):
     """
-    Plots and saves the raw and filtered ECG signals.
-    
-    Parameters:
-    - raw_ecg: Raw ECG signal.
-    - ecg_filtered: Filtered ECG signal.
-    - file: File name for labeling the plot.
-    - output_dir: Directory where the plot will be saved.
+    Remove unlikely R-peaks based on RR intervals.
+
     """
-    os.makedirs(output_dir, exist_ok=True)
+    r = np.asarray(rpeaks["ECG_R_Peaks"], dtype=int)
 
-    raw_ecg_muV = raw_ecg * 1e6
-    ecg_filtered_muV = ecg_filtered * 1e6
+    if len(r) < 3:
+        return rpeaks, {
+            "n_rpeaks_before": len(r),
+            "n_rpeaks_after": len(r),
+            "removed_percentage": 0.0,
+        }
 
-    plt.figure(figsize=(12, 6))
-    plt.plot(raw_ecg_muV, label="Raw ECG (µV)", alpha=0.6, linewidth=1.0)
-    plt.plot(ecg_filtered_muV, label="Filtered ECG (µV)", color='r', alpha=0.8, linewidth=1.0)
-    plt.title("ECG Before and After Filtering", fontsize=14)
-    plt.xlabel("Time (samples)", fontsize=12)
-    plt.ylabel("Amplitude (µV)", fontsize=12)
-    plt.legend(fontsize=10)
-    plt.grid(alpha=0.4)
+    rr_ms = np.diff(r) / fs * 1000
 
+    median_rr = np.median(rr_ms)
+    mad_rr = np.median(np.abs(rr_ms - median_rr))
+
+    if mad_rr == 0:
+        mad_outliers = np.zeros(len(rr_ms), dtype=bool)
+    else:
+        mad_outliers = np.abs(rr_ms - median_rr) / mad_rr > mad_threshold
+
+    physiological_outliers = (rr_ms < min_rr_ms) | (rr_ms > max_rr_ms)
+    bad_rr = mad_outliers | physiological_outliers
+
+    # For each bad interval, remove the second R-peak.
+    bad_peak_positions = np.where(bad_rr)[0] + 1
+    bad_peak_positions = np.unique(bad_peak_positions)
+
+    keep = np.ones(len(r), dtype=bool)
+    keep[bad_peak_positions] = False
+
+    r_clean = r[keep]
+
+    report = {
+        "n_rpeaks_before": int(len(r)),
+        "n_rpeaks_after": int(len(r_clean)),
+        "n_removed_rpeaks": int(len(bad_peak_positions)),
+        "removed_percentage": float(len(bad_peak_positions) / len(r) * 100),
+        "median_rr_ms": float(median_rr),
+        "mad_rr_ms": float(mad_rr),
+    }
+
+    rpeaks_clean = dict(rpeaks)
+    rpeaks_clean["ECG_R_Peaks"] = r_clean
+
+    return rpeaks_clean, report
+
+
+def valid_index(x, n):
+    try:
+        if x is None:
+            return False
+
+        x = float(x)
+
+        if np.isnan(x) or np.isinf(x):
+            return False
+
+        x = int(round(x))
+        return 0 <= x < n
+
+    except Exception:
+        return False
+
+
+def to_index(x):
+    return int(round(float(x)))
+
+
+def get_wave(waves, name, i):
+    try:
+        return waves[name][i]
+    except Exception:
+        return np.nan
+
+
+def angle_between_points(left, centre, right, signal, fs=FS):
+    """
+    Angle at the centre point.
+
+    The x-axis is time in ms and the y-axis is ECG amplitude in microvolts.
+    """
+    signal_uv = signal * 1e6
+
+    p1 = np.array([left / fs * 1000, signal_uv[left]])
+    p2 = np.array([centre / fs * 1000, signal_uv[centre]])
+    p3 = np.array([right / fs * 1000, signal_uv[right]])
+
+    v1 = p1 - p2
+    v2 = p3 - p2
+
+    denom = np.linalg.norm(v1) * np.linalg.norm(v2)
+
+    if denom == 0:
+        return np.nan
+
+    cos_angle = np.dot(v1, v2) / denom
+    cos_angle = np.clip(cos_angle, -1, 1)
+
+    return float(np.degrees(np.arccos(cos_angle)))
+
+
+def extract_morphology(ecg_clean, rpeaks, fs=FS):
+    """Extract ECG morphology features from delineated ECG waves."""
+    features = {
+        "qrs_duration_ms": [],
+        "st_segment_ms": [],
+        "pr_interval_ms": [],
+        "pr_segment_ms": [],
+        "qt_interval_ms": [],
+        "p_amp_uV": [],
+        "q_amp_uV": [],
+        "r_amp_uV": [],
+        "s_amp_uV": [],
+        "t_amp_uV": [],
+        "q_angle_deg": [],
+        "r_angle_deg": [],
+        "s_angle_deg": [],
+    }
+
+    r = np.asarray(rpeaks["ECG_R_Peaks"], dtype=int)
+
+    if len(r) == 0:
+        return features
+
+    try:
+        _, waves = nk.ecg_delineate(
+            ecg_clean,
+            rpeaks,
+            sampling_rate=fs,
+            method="dwt"
+        )
+    except Exception as e:
+        logger.warning("ECG delineation failed: %s", e)
+        return features
+
+    n = len(ecg_clean)
+
+    for i, r_peak in enumerate(r):
+        p_on = get_wave(waves, "ECG_P_Onsets", i)
+        p_peak = get_wave(waves, "ECG_P_Peaks", i)
+        p_off = get_wave(waves, "ECG_P_Offsets", i)
+
+        q_peak = get_wave(waves, "ECG_Q_Peaks", i)
+
+        r_on = get_wave(waves, "ECG_R_Onsets", i)
+        r_off = get_wave(waves, "ECG_R_Offsets", i)
+
+        s_peak = get_wave(waves, "ECG_S_Peaks", i)
+
+        t_on = get_wave(waves, "ECG_T_Onsets", i)
+        t_peak = get_wave(waves, "ECG_T_Peaks", i)
+        t_off = get_wave(waves, "ECG_T_Offsets", i)
+
+        points = [
+            p_on, p_peak, p_off,
+            q_peak, r_on, r_peak, r_off,
+            s_peak, t_on, t_peak, t_off,
+        ]
+
+        if not all(valid_index(x, n) for x in points):
+            continue
+
+        p_on = to_index(p_on)
+        p_peak = to_index(p_peak)
+        p_off = to_index(p_off)
+        q_peak = to_index(q_peak)
+        r_on = to_index(r_on)
+        r_peak = to_index(r_peak)
+        r_off = to_index(r_off)
+        s_peak = to_index(s_peak)
+        t_on = to_index(t_on)
+        t_peak = to_index(t_peak)
+        t_off = to_index(t_off)
+
+        qrs_ms = (r_off - r_on) / fs * 1000
+        st_ms = (t_on - r_off) / fs * 1000
+        pr_interval_ms = (r_on - p_on) / fs * 1000
+        pr_segment_ms = (r_on - p_off) / fs * 1000
+        qt_ms = (t_off - r_on) / fs * 1000
+
+        # Skip clearly impossible delineations.
+        if any(x <= 0 for x in [qrs_ms, pr_interval_ms, qt_ms]):
+            continue
+
+        features["qrs_duration_ms"].append(float(qrs_ms))
+        features["st_segment_ms"].append(float(st_ms))
+        features["pr_interval_ms"].append(float(pr_interval_ms))
+        features["pr_segment_ms"].append(float(pr_segment_ms))
+        features["qt_interval_ms"].append(float(qt_ms))
+
+        features["p_amp_uV"].append(float(ecg_clean[p_peak] * 1e6))
+        features["q_amp_uV"].append(float(ecg_clean[q_peak] * 1e6))
+        features["r_amp_uV"].append(float(ecg_clean[r_peak] * 1e6))
+        features["s_amp_uV"].append(float(ecg_clean[s_peak] * 1e6))
+        features["t_amp_uV"].append(float(ecg_clean[t_peak] * 1e6))
+
+        features["q_angle_deg"].append(
+            angle_between_points(p_peak, q_peak, r_peak, ecg_clean, fs)
+        )
+
+        features["r_angle_deg"].append(
+            angle_between_points(q_peak, r_peak, s_peak, ecg_clean, fs)
+        )
+
+        features["s_angle_deg"].append(
+            angle_between_points(r_peak, s_peak, t_peak, ecg_clean, fs)
+        )
+
+    return features
+
+
+def get_df_value(df, col):
+    try:
+        return float(df[col].iloc[0])
+    except Exception:
+        return np.nan
+
+
+def extract_hrv(rpeaks, fs=FS):
+    """Extract time, frequency and nonlinear HRV features."""
+    r = np.asarray(rpeaks["ECG_R_Peaks"], dtype=int)
+
+    features = {
+        "MeanNN": np.nan,
+        "SDNN": np.nan,
+        "RMSSD": np.nan,
+        "SDSD": np.nan,
+        "MinNN": np.nan,
+        "MaxNN": np.nan,
+        "LF": np.nan,
+        "HF": np.nan,
+        "LFHF": np.nan,
+        "SD1": np.nan,
+        "SD2": np.nan,
+        "SD1SD2": np.nan,
+        "CSI": np.nan,
+        "CVI": np.nan,
+        "SpecEn": np.nan,
+        "RenEn_alpha2": np.nan,
+        "LZC": np.nan,
+    }
+
+    for m in [1, 2]:
+        for r_frac in [0.1, 0.2]:
+            features[f"SampEn_m{m}_r{r_frac}"] = np.nan
+            features[f"FuzzyEn_m{m}_r{r_frac}"] = np.nan
+
+    for m in [3, 4, 5]:
+        features[f"PermEn_m{m}"] = np.nan
+
+    for c in [5, 6, 7]:
+        features[f"DispEn_c{c}"] = np.nan
+
+    for kmax in [5, 10, 20]:
+        features[f"HFD_k{kmax}"] = np.nan
+
+    if len(r) < 4:
+        return features
+
+    peaks = {"ECG_R_Peaks": r}
+    rr = np.diff(r) / fs
+    rr_std = np.std(rr)
+
+    try:
+        hrv_time = nk.hrv_time(peaks, sampling_rate=fs, show=False)
+
+        features["MeanNN"] = get_df_value(hrv_time, "HRV_MeanNN")
+        features["SDNN"] = get_df_value(hrv_time, "HRV_SDNN")
+        features["RMSSD"] = get_df_value(hrv_time, "HRV_RMSSD")
+        features["SDSD"] = get_df_value(hrv_time, "HRV_SDSD")
+        features["MinNN"] = get_df_value(hrv_time, "HRV_MinNN")
+        features["MaxNN"] = get_df_value(hrv_time, "HRV_MaxNN")
+
+    except Exception as e:
+        logger.warning("Time-domain HRV failed: %s", e)
+
+    try:
+        hrv_freq = nk.hrv_frequency(
+            peaks,
+            sampling_rate=fs,
+            interpolation_rate=4,
+            psd_method="welch",
+            normalize=True,
+            show=False
+        )
+
+        features["LF"] = get_df_value(hrv_freq, "HRV_LF")
+        features["HF"] = get_df_value(hrv_freq, "HRV_HF")
+        features["LFHF"] = get_df_value(hrv_freq, "HRV_LFHF")
+
+    except Exception as e:
+        logger.warning("Frequency-domain HRV failed: %s", e)
+
+    try:
+        hrv_non = nk.hrv_nonlinear(peaks, sampling_rate=fs, show=False)
+
+        features["SD1"] = get_df_value(hrv_non, "HRV_SD1")
+        features["SD2"] = get_df_value(hrv_non, "HRV_SD2")
+        features["SD1SD2"] = get_df_value(hrv_non, "HRV_SD1SD2")
+        features["CSI"] = get_df_value(hrv_non, "HRV_CSI")
+        features["CVI"] = get_df_value(hrv_non, "HRV_CVI")
+
+    except Exception as e:
+        logger.warning("Nonlinear HRV failed: %s", e)
+
+    for m in [1, 2]:
+        for r_frac in [0.1, 0.2]:
+            tolerance = r_frac * rr_std
+
+            try:
+                value, _ = nk.entropy_sample(
+                    rr,
+                    delay=1,
+                    dimension=m,
+                    tolerance=tolerance
+                )
+                features[f"SampEn_m{m}_r{r_frac}"] = float(value)
+            except Exception:
+                pass
+
+            try:
+                value, _ = nk.entropy_fuzzy(
+                    rr,
+                    delay=1,
+                    dimension=m,
+                    tolerance=tolerance,
+                    n=2
+                )
+                features[f"FuzzyEn_m{m}_r{r_frac}"] = float(value)
+            except Exception:
+                pass
+
+    try:
+        value, _ = nk.entropy_renyi(rr, alpha=2)
+        features["RenEn_alpha2"] = float(value)
+    except Exception:
+        pass
+
+    for m in [3, 4, 5]:
+        try:
+            value, _ = nk.entropy_permutation(
+                rr,
+                delay=1,
+                dimension=m
+            )
+            features[f"PermEn_m{m}"] = float(value)
+        except Exception:
+            pass
+
+    for c in [5, 6, 7]:
+        try:
+            value, _ = nk.entropy_dispersion(
+                rr,
+                delay=1,
+                dimension=2,
+                c=c
+            )
+            features[f"DispEn_c{c}"] = float(value)
+        except Exception:
+            pass
+
+    rr_interp = interpolate_rr(rr)
+
+    if rr_interp is not None:
+        try:
+            psd = nk.signal_psd(rr_interp, sampling_rate=4)
+            power = psd["Power"].values.astype(float)
+
+            if power.sum() > 0:
+                power = power / power.sum()
+                spen, _ = nk.entropy_shannon(freq=power)
+                features["SpecEn"] = float(spen / np.log2(len(power)))
+
+        except Exception:
+            pass
+
+        for kmax in [5, 10, 20]:
+            try:
+                value, _ = nk.fractal_higuchi(rr_interp, k_max=kmax)
+                features[f"HFD_k{kmax}"] = float(value)
+            except Exception:
+                pass
+
+        try:
+            value, _ = nk.complexity_lempelziv(
+                rr_interp,
+                symbolize="mean"
+            )
+            features["LZC"] = float(value)
+        except Exception:
+            pass
+
+    return features
+
+
+def interpolate_rr(rr, target_fs=4):
+    """Interpolate RR intervals to a regular time axis."""
+    if len(rr) < 3:
+        return None
+
+    rr_time = np.cumsum(rr)
+
+    if rr_time[-1] <= rr_time[0]:
+        return None
+
+    n_samples = int((rr_time[-1] - rr_time[0]) * target_fs)
+
+    if n_samples < 3:
+        return None
+
+    new_time = np.linspace(rr_time[0], rr_time[-1], n_samples)
+
+    try:
+        f = scipy.interpolate.interp1d(
+            rr_time,
+            rr,
+            kind="linear",
+            fill_value="extrapolate"
+        )
+
+        return f(new_time)
+
+    except Exception:
+        return None
+
+
+def plot_ecg(raw_ecg, clean_ecg, fs, file_name, output_dir):
+    """Save a quick plot of raw and cleaned ECG."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    n = min(len(raw_ecg), len(clean_ecg))
+    t = np.arange(n) / fs
+
+    plt.figure(figsize=(12, 5))
+    plt.plot(t, raw_ecg[:n] * 1e6, label="Raw ECG", alpha=0.6)
+    plt.plot(t, clean_ecg[:n] * 1e6, label="Cleaned ECG", alpha=0.8)
+    plt.xlabel("Time (s)")
+    plt.ylabel("Amplitude (µV)")
+    plt.title("Raw and cleaned ECG")
+    plt.legend()
     plt.tight_layout()
 
-    output_image_path = os.path.join(output_dir, f"{file}_ecg_plot.png")
-    plt.savefig(output_image_path, dpi=300)
+    out_file = output_dir / f"{Path(file_name).stem}_ecg.png"
+    plt.savefig(out_file, dpi=300)
     plt.close()
 
-def angle_of_vectors(a,b,c,d):
-    
-     dotProduct = a*c + b*d
-         # for three dimensional simply add dotProduct = a*c + b*d  + e*f 
-     modOfVector1 = math.sqrt(a*a + b*b)*math.sqrt(c*c + d*d) 
-         # for three dimensional simply add modOfVector = math.sqrt( a*a + b*b + e*e)*math.sqrt(c*c + d*d +f*f) 
-     angle = dotProduct/modOfVector1
-     angleInDegree = math.degrees(math.acos(angle))
-     return angleInDegree
 
-def morphology(sig, rpeaks, Fs):
+def parse_condition(file_name):
     """
-    Extracts morphological features such as QRS duration, ST segment, and angles.
-    
-    Parameters:
-    - sig: Cleaned ECG signal.
-    - rpeaks: Dictionary containing R-peak indices.
-    - Fs: Sampling frequency of the signal.
-    
-    Returns:
-    - ECG_morphology: Dictionary of extracted morphological features.
-    """
-    _, waves = nk.ecg_delineate(sig, rpeaks, sampling_rate = Fs)
-    
-    # morphological features
-    qrs_dur = []
-    st_seg = []
-    pr_int = []
-    pr_seg = []
-    qt_int = []
-    p_peaks = []
-    q_peaks = []
-    r_peaks = []
-    s_peaks = []
-    t_peaks = []
-    q_angle = []
-    r_angle = []
-    s_angle = []
-    for i in range(len(rpeaks['ECG_R_Peaks'])):
-        p_off = waves['ECG_P_Offsets'][i]
-        p_on = waves['ECG_P_Onsets'][i]
-        p_peak = waves['ECG_P_Peaks'][i]
-        q_peak = waves['ECG_Q_Peaks'][i]
-        r_off = waves['ECG_R_Offsets'][i]
-        r_on = waves['ECG_R_Onsets'][i]
-        s_peak = waves['ECG_S_Peaks'][i] 
-        t_off = waves['ECG_T_Offsets'][i]
-        t_on = waves['ECG_T_Onsets'][i]
-        t_peak = waves['ECG_T_Peaks'][i]
-        if ~np.isnan([p_off,p_on,p_peak,q_peak,r_off,r_on,s_peak,t_off,t_on,t_peak]).any() and ~np.isinf([p_off,p_on,p_peak,q_peak,r_off,r_on,s_peak,t_off,t_on,t_peak]).any():
-            # intervals        
-            qrs = r_off - r_on            
-            qrs_dur.append(qrs)
-            st = t_on - r_off
-            st_seg.append(st)
-            pr = r_on - p_on
-            pr_int.append(pr)
-            qt = t_off - r_on
-            qt_int.append(qt)
-            pr = r_on - p_off
-            pr_seg.append(pr)
-            # amplitudes
-            p = sig[p_peak]
-            p_peaks.append(p)
-            q = sig[q_peak]
-            q_peaks.append(q)
-            r = sig[rpeaks['ECG_R_Peaks'][i]]
-            r_peaks.append(r)
-            s = sig[s_peak]
-            s_peaks.append(s)
-            t = sig[t_peak]
-            t_peaks.append(t)
-            # angles
-            q_x0 = q_peak
-            q_y0 = sig[q_x0]
-            q_x1 =  p_peak - q_x0
-            q_y1 = sig[q_x1] - q_y0
-            q_x2 =  rpeaks['ECG_R_Peaks'][i] - q_x0
-            q_y2 = sig[q_x2] - q_y0
-            angle = angle_of_vectors(q_x1,q_y1,q_x2,q_y2)
-            q_angle.append(angle)    
-            r_x0 = rpeaks['ECG_R_Peaks'][i]
-            r_y0 = sig[r_x0]
-            r_x1 =  q_peak - r_x0
-            r_y1 = sig[r_x1] - r_y0
-            r_x2 =  s_peak - r_x0
-            r_y2 = sig[r_x2] - r_y0
-            angle = angle_of_vectors(r_x1,r_y1,r_x2,r_y2)
-            r_angle.append(angle)    
-            s_x0 = s_peak
-            s_y0 = sig[s_x0]
-            s_x1 =  rpeaks['ECG_R_Peaks'][i] - s_x0
-            s_y1 = sig[s_x1] - s_y0
-            s_x2 =  t_peak - s_x0
-            s_y2 = sig[s_x2] - s_y0
-            angle = angle_of_vectors(s_x1,s_y1,s_x2,s_y2)
-            s_angle.append(angle)
-        
-    ECG_morphology = {'qrs_dur':qrs_dur,'st_seg':st_seg,'pr_int':pr_int,
-                      'pr_seg':pr_seg,'qt_int':qt_int,'p_peak':p_peaks,
-                      'q_peak':q_peaks,'r_peak':r_peaks,'s_peak':s_peaks,
-                      't_peak':t_peaks,'q_angle':q_angle,'r_angle':r_angle,
-                      's_angle':s_angle}
-    return ECG_morphology
+    Detect condition from file name.
 
-def hrv(peaks,rpeaks,Fs):
+    examples:
+    SubID_Pre_Ictal_1.edf
+    SubID_Inter_Ictal_1.edf
     """
-    Extracts heart rate variability (HRV) features including time-domain, frequency-domain, and non-linear metrics.
-    
-    Parameters:
-    - peaks: Detected peaks in the ECG signal.
-    - rpeaks: Dictionary containing R-peak indices.
-    - Fs: Sampling frequency of the signal.
-    
-    Returns:
-    - ECG_hrv: Dictionary of extracted HRV features.
-    """
-    # HRV features
-    interpolation_rate = 5
-    rri = _hrv_get_rri(rpeaks['ECG_R_Peaks'], sampling_rate=Fs, interpolate=True, interpolation_rate=interpolation_rate)[0]
-    rri = nk.intervals_to_peaks(rri)
-    hrv_time_domain = nk.hrv_time(rri, sampling_rate=Fs)
-    hrv_frequency_domain = nk.hrv_frequency(peaks, sampling_rate=Fs,interpolation_rate=interpolation_rate)
-    hrv_poincare = nk.hrv_nonlinear(rri, sampling_rate=Fs)
-    # k_max, _ = nk.complexity_k(rri) 
-    hfd, _ = nk.fractal_higuchi(rri, k_max='default')      
-    d, _ = nk.complexity_dimension(rri)
-    t, _ = nk.complexity_tolerance(rri,method='nolds',dimension=d)
-    SampEn, _ = nk.entropy_sample(rri,dimension=d,tolerance=t)
-    MSEn, _ = nk.entropy_multiscale(rri,dimension=d,tolerance=t,scale='default')
-    LZC, _ = nk.complexity_lempelziv(rri,dimension=d)
-    
-    ECG_hrv = {'MeanNN':hrv_time_domain['HRV_MeanNN'][0],'SDNN':hrv_time_domain['HRV_SDNN'][0],
-                'RMSSD':hrv_time_domain['HRV_RMSSD'][0],'SDSD':hrv_time_domain['HRV_SDSD'][0],
-                'CVNN':hrv_time_domain['HRV_CVNN'][0],'CVSD':hrv_time_domain['HRV_CVSD'][0],
-                'MedianNN':hrv_time_domain['HRV_MedianNN'][0],'MadNN':hrv_time_domain['HRV_MadNN'][0],
-                'MCVNN':hrv_time_domain['HRV_MCVNN'][0],'IQRNN':hrv_time_domain['HRV_IQRNN'][0],
-                'Prc20NN':hrv_time_domain['HRV_Prc20NN'][0],'Prc80NN':hrv_time_domain['HRV_Prc80NN'][0],
-                'MinNN':hrv_time_domain['HRV_MinNN'][0],'MaxNN':hrv_time_domain['HRV_MaxNN'][0],
-                'LF':hrv_frequency_domain['HRV_LF'][0],'HF':hrv_frequency_domain['HRV_HF'][0],
-                'LFHF':hrv_frequency_domain['HRV_LFHF'][0],'SD1':hrv_poincare['HRV_SD1'][0],
-                'SD2':hrv_poincare['HRV_SD2'][0],'SD1SD2':hrv_poincare['HRV_SD1SD2'][0],
-                'CSI':hrv_poincare['HRV_CSI'][0],'CVI':hrv_poincare['HRV_CVI'][0],
-                'SampEn':SampEn,'MSEn':MSEn,'HFD':hfd,'LZC':LZC}
-    return ECG_hrv
+    name = file_name.lower()
 
-# Main Processing Pipeline
-def process_data(edf_directory, output_dir):
+    if "pre_ictal" in name or "preictal" in name or "pre-ictal" in name:
+        return "preictal"
+
+    if "post_ictal" in name or "postictal" in name or "post-ictal" in name:
+        return "postictal"
+
+    if "inter_ictal" in name or "interictal" in name or "inter-ictal" in name:
+        return "interictal"
+
+    if "ictal" in name:
+        return "ictal"
+
+    return None
+
+
+def get_patient_id(file_name):
     """
-    Main pipeline to process ECG data, extract HRV and morphological features, and save them.
-    
-    Parameters:
-    - edf_directory: Directory containing the EDF files.
-    - output_dir: Directory where the processed features will be saved.
+    Extract patient ID from file name.
+
     """
-    edf_files = [f for f in os.listdir(edf_directory) if f.endswith('.edf')]
-    
-    # Identify files and group by patient
+    return file_name.split("_")[0]
+
+
+def get_data_files(input_dir):
+    input_dir = Path(input_dir)
+    return sorted(
+        list(input_dir.glob("*.edf")) +
+        list(input_dir.glob("*.EDF")) +
+        list(input_dir.glob("*.fif")) +
+        list(input_dir.glob("*.fif.gz"))
+    )
+
+def load_raw_file(file_path):
+    file_path = Path(file_path)
+    suffix = file_path.suffix.lower()
+
+    if suffix == ".edf":
+        return mne.io.read_raw_edf(file_path, preload=True, verbose="ERROR")
+
+    if suffix == ".fif" or file_path.name.lower().endswith(".fif.gz"):
+        return mne.io.read_raw_fif(file_path, preload=True, verbose="ERROR")
+
+    raise ValueError(f"Unsupported file type: {file_path}")
+
+def group_by_patient(files):
     patient_files = defaultdict(list)
+
+    for file_path in files:
+        patient_id = get_patient_id(file_path.name)
+        patient_files[patient_id].append(file_path)
+
+    return patient_files
+
+
+def patient_has_required_files(files):
+    conditions = {parse_condition(f.name) for f in files}
+    conditions.discard(None)
+
+    has_interictal = "interictal" in conditions
+    has_event = any(c in conditions for c in ["preictal", "ictal", "postictal"])
+
+    return has_interictal and has_event
+
+
+def process_file(file_path, fs=FS, save_plot=False, plot_dir=None):
+    """Process one FIF/EDF file and return ECG features."""
+    raw = load_raw_file(file_path)
+
+    ecg_clean, ecg_raw, clean_info = clean_ecg(raw, fs=fs)
+
+    if save_plot and plot_dir is not None:
+        plot_ecg(ecg_raw, ecg_clean, fs, file_path.name, plot_dir)
+
+    rpeaks = detect_rpeaks(ecg_clean, fs=fs)
+    rpeaks, rpeak_report = remove_bad_rpeaks(rpeaks, fs=fs)
+
+    n_rpeaks = len(rpeaks["ECG_R_Peaks"])
+
+    if n_rpeaks < MIN_RPEAKS:
+        raise ValueError(f"Too few R-peaks detected: {n_rpeaks}")
+
+    morphology = extract_morphology(ecg_clean, rpeaks, fs=fs)
+    hrv = extract_hrv(rpeaks, fs=fs)
+
+    features = {
+        "file_name": file_path.name,
+        "duration_sec": len(ecg_clean) / fs,
+        "sampling_rate": fs,
+        "num_rpeaks": n_rpeaks,
+        "cleaning": clean_info,
+        "rpeak_filtering": rpeak_report,
+        "morphology": morphology,
+        "hrv": hrv,
+    }
+
+    return features
+
+
+def process_data(input_dir, output_dir, fs=FS, save_plots=False):
+    input_dir = Path(input_dir)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    plot_dir = output_dir / "plots" if save_plots else None
+
+    data_files = get_data_files(input_dir)
+    logger.info("Found %d EDF/FIF files", len(data_files))
     
-    for file in edf_files:
-        # Extract patient identifier and condition
-        parts = file.split('_')
-        patient_id = parts[0]  # e.g., "2016M33"
-        patient_files[patient_id].append(file)
-        
-    # Filter patients with both preictal and interictal files
+    patient_files = group_by_patient(data_files)
+    
     valid_patients = {
         patient: files
         for patient, files in patient_files.items()
-        if any("Pre" in f for f in files) and any("Inter" in f for f in files)
+        if patient_has_required_files(files)
     }
-    
-    for patient, files in valid_patients.items():
-        print(f"Processing patient: {patient}")
-        preictal_ecg = []
-        interictal_ecg = []
-    
-        for file in files:
-            file_path = os.path.join(edf_directory, file)
-            raw = mne.io.read_raw_edf(file_path, preload=True)
-    
+
+    logger.info("Found %d patients with event and interictal files", len(valid_patients))
+
+    for patient, files in tqdm(valid_patients.items(), desc="Processing patients"):
+        patient_features = defaultdict(list)
+
+        for file_path in files:
+            condition = parse_condition(file_path.name)
+
+            if condition is None:
+                logger.warning("Could not detect condition for %s", file_path.name)
+                continue
+
             try:
-                ecg_cleaned, ecg_raw, removal_perc = ECGfilter(raw, Fs=256)
-            except ValueError as e:
-                print(f"Skipping file {file} due to missing ECG channels: {e}")
-                continue
-    
-            peaks, rpeaks = nk.ecg_peaks(ecg_cleaned, sampling_rate=256, method='nabian2018')
-            if np.count_nonzero(peaks) <= 50:
-                print(f"Skipping file {file} due to insufficient R-peaks ({np.count_nonzero(peaks)}).")
-                continue
-    
-            # plot_ecg(ecg_raw, ecg_cleaned, file, output_dir)
-            
-            # Extract ECG morphological features
-            morphology_features = morphology(ecg_cleaned, rpeaks, Fs=256)
-            
-            # Extract ECG HRV features
-            hrv_features = hrv(peaks, rpeaks, Fs=256)
-            
-            # Combine ECG features
-            ecg_features = {
-                "morphology": morphology_features,
-                "hrv": hrv_features,
-                "artifact_removal_rate": removal_perc
-            }
-            
-            # Store features based on condition
-            if "Pre" in file:
-                preictal_ecg.append(ecg_features)
-            elif "Inter" in file:
-                interictal_ecg.append(ecg_features)
-        
-        # Save data for preictal condition
-        if preictal_ecg:
-            with open(os.path.join(output_dir, f"{patient}_preictal_ECG_features.json"), "w") as f:
-                json.dump(preictal_ecg, f, indent=4)
-            print(f"Saved preictal ECG features for patient {patient}.")
-        
-        # Save data for interictal condition
-        if interictal_ecg:
-            with open(os.path.join(output_dir, f"{patient}_interictal_ECG_features.json"), "w") as f:
-                json.dump(interictal_ecg, f, indent=4)
-            print(f"Saved interictal ECG features for patient {patient}.")
+                features = process_file(
+                    file_path,
+                    fs=fs,
+                    save_plot=save_plots,
+                    plot_dir=plot_dir
+                )
 
-# Define directories and run the pipeline
-edf_directory = "C:\\Path\\To\\EDF_Files"
-output_dir = "C:\\Path\\To\\Processed_Data"
-process_data(edf_directory, output_dir)
+                features["patient_id"] = patient
+                features["condition"] = condition
 
+                patient_features[condition].append(features)
+
+            except Exception as e:
+                logger.warning("Skipping %s: %s", file_path.name, e)
+
+        for condition, features in patient_features.items():
+            if len(features) == 0:
+                continue
+
+            out_file = output_dir / f"{patient}_{condition}_ECG_features.json"
+
+            with open(out_file, "w", encoding="utf-8") as f:
+                json.dump(
+                    json_friendly(features),
+                    f,
+                    indent=4,
+                    ensure_ascii=False,
+                    allow_nan=False
+                )
+
+            logger.info("Saved %s", out_file)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Extract ECG morphology and HRV features from FIF files."
+    )
+
+    parser.add_argument(
+        "--input_dir",
+        required=True,
+        help="Folder containing FIF files."
+    )
+
+    parser.add_argument(
+        "--output_dir",
+        required=True,
+        help="Folder where feature files will be saved."
+    )
+
+    parser.add_argument(
+        "--fs",
+        type=int,
+        default=FS,
+        help="Target sampling frequency. Default is 256 Hz."
+    )
+
+    parser.add_argument(
+        "--save_plots",
+        action="store_true",
+        help="Save raw/cleaned ECG plots."
+    )
+
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(levelname)s: %(message)s"
+    )
+
+    process_data(
+        input_dir=args.input_dir,
+        output_dir=args.output_dir,
+        fs=args.fs,
+        save_plots=args.save_plots
+    )
+
+
+if __name__ == "__main__":
+    main()
