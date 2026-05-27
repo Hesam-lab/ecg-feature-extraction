@@ -1,0 +1,12 @@
+# Core packages used to run the ECG feature extraction pipeline
+mne==1.8.0
+neurokit2==0.2.10
+
+# Direct imports used in the code
+numpy
+scipy
+matplotlib
+tqdm
+
+# Used indirectly by NeuroKit2 HRV functions/dataframes
+pandas
