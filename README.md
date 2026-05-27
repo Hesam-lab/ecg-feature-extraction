@@ -185,5 +185,3 @@ Each JSON file contains:
 Alaei, H. (2026). ECG Feature Extraction from EDF/FIF Recordings. GitHub repository:
 https://github.com/Hesam-lab/ecg-feature-extraction
 
----
-
