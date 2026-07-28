@@ -133,17 +133,15 @@ pip install -r requirements.txt
 
 ## Usage
 
-Save the main script as:
-
-```text
-ecg_feature_extraction.py
-```
-
-Then run it from the command line:
+Run the script.py file:
 
 ```bash
-python ecg_feature_extraction.py --input_dir "path/to/edf_or_fif_files" --output_dir "path/to/output_folder" --fs 256
+python script.py \
+  --input_dir "path/to/edf_or_fif_files" \
+  --output_dir "path/to/output_folder" \
+  --fs 256
 ```
+On Windows PowerShell.
 
 To save raw-vs-cleaned ECG plots as well:
 
