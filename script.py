@@ -672,16 +672,10 @@ def process_data(input_dir, output_dir, fs=FS, save_plots=False):
     logger.info("Found %d EDF/FIF files", len(data_files))
     
     patient_files = group_by_patient(data_files)
-    
-    valid_patients = {
-        patient: files
-        for patient, files in patient_files.items()
-        if patient_has_required_files(files)
-    }
 
-    logger.info("Found %d patients with event and interictal files", len(valid_patients))
+    logger.info("Found %d patients", len(patient_files))
 
-    for patient, files in tqdm(valid_patients.items(), desc="Processing patients"):
+    for patient, files in tqdm(patient_files.items(), desc="Processing patients"):
         patient_features = defaultdict(list)
 
         for file_path in files:
