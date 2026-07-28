@@ -107,33 +107,45 @@ Interval features are saved in milliseconds, and amplitude features are saved in
 
 ## Requirements
 
-The code was run using the following package versions:
+The repository was developed using:
 
 ```text
 mne==1.8.0
 neurokit2==0.2.10
 ```
 
-Other required packages include:
+Additional dependencies are listed in `requirements.txt`.
 
-```text
-numpy
-scipy
-matplotlib
-tqdm
-```
+## Installation
 
-You can install the required packages using:
+Clone the repository:
 
 ```bash
+git clone https://github.com/Hesam-lab/ecg-feature-extraction.git
+cd ecg-feature-extraction
+```
+
+Creating a virtual environment is recommended.
+
+### Windows
+
+```bash
+python -m venv .venv
+.venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
----
+### macOS or Linux
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
 
 ## Usage
 
-Run the script.py file:
+Run the included `script.py` file:
 
 ```bash
 python script.py \
@@ -141,15 +153,42 @@ python script.py \
   --output_dir "path/to/output_folder" \
   --fs 256
 ```
-On Windows PowerShell.
 
-To save raw-vs-cleaned ECG plots as well:
+On Windows PowerShell, the command can be entered on one line:
 
-```bash
-python ecg_feature_extraction.py --input_dir "path/to/edf_or_fif_files" --output_dir "path/to/output_folder" --fs 256 --save_plots
+```powershell
+python script.py --input_dir "C:\path\to\recordings" --output_dir "C:\path\to\output" --fs 256
 ```
 
----
+### Required arguments
+
+| Argument | Description |
+|---|---|
+| `--input_dir` | Directory containing EDF or FIF recordings |
+| `--output_dir` | Directory in which JSON feature files will be saved |
+
+### Optional arguments
+
+| Argument | Default | Description |
+|---|---:|---|
+| `--fs` | `256` | Target ECG sampling frequency in hertz |
+| `--save_plots` | Off | Save raw-versus-cleaned ECG plots |
+
+To save ECG plots:
+
+```bash
+python script.py \
+  --input_dir "path/to/edf_or_fif_files" \
+  --output_dir "path/to/output_folder" \
+  --fs 256 \
+  --save_plots
+```
+
+To view all command-line options:
+
+```bash
+python script.py --help
+```
 
 ## Output
 
