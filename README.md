@@ -154,11 +154,7 @@ python script.py \
   --fs 256
 ```
 
-On Windows PowerShell, the command can be entered on one line:
-
-```powershell
-python script.py --input_dir "C:\path\to\recordings" --output_dir "C:\path\to\output" --fs 256
-```
+On Windows PowerShell.
 
 ### Required arguments
 
