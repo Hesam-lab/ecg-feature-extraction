@@ -49,7 +49,7 @@ Digital filtering is then performed with `neurokit2.ecg_clean(..., method="biosp
 
 The resulting digitally filtered ECG—not the raw ECG—is used for Nabian R-peak detection and waveform delineation.
 
-### Abnormal RR identification and the paper's exclusion method
+### Abnormal RR identification
 
 R-peaks are detected once with NeuroKit2's `nabian2018` method. The detected peak array is preserved: the pipeline does not relocate or overwrite these observed peaks. RR intervals are calculated as the time differences between consecutive detected R-peaks.
 
@@ -73,6 +73,8 @@ median(RR) ± mad_threshold × MAD(RR) / 0.6745
 
 For morphology estimation, both detected R-peaks bounding an excluded RR interval are omitted from waveform delineation. For HRV estimation, only retained RR values are passed to NeuroKit2 and the custom entropy/complexity calculations. No synthetic RR values or beat timestamps are generated.
 
+### Interpolation of cleaned RR interval signal
+
 Interpolation is applied only where a uniformly sampled RR interval is required for a particular HRV calculation:
 
 | Feature group | RR-series processing |
@@ -83,7 +85,7 @@ Interpolation is applied only where a uniformly sampled RR interval is required 
 | Sample, fuzzy, Rényi, permutation and dispersion entropy | Calculated directly from the retained, non-interpolated RR values |
 | Spectral entropy, Higuchi fractal dimension and Lempel–Ziv complexity | The concatenated retained RR values are linearly interpolated at **4 Hz** by the pipeline's `interpolate_rr()` function |
 
-These interpolation steps create an evenly sampled representation of the retained RR series; they do **not** reconstruct excluded RR intervals or fill the original artefact gap. Because original RR timestamps are not supplied to the HRV functions, the interpolation operates on the shortened, concatenated timeline.
+These interpolation steps create an evenly sampled representation of the retained RR series.
 
 ---
 
