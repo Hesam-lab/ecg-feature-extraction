@@ -15,8 +15,7 @@ import scipy.interpolate
 from scipy.signal import resample_poly
 from tqdm import tqdm
 
-
-__version__ = "3.4.0"
+__version__ = "1.1.0"
 
 mne.set_log_level("ERROR")
 
