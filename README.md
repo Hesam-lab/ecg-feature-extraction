@@ -301,7 +301,7 @@ The repository includes a simple demonstration script rather than a unit-test su
 python tests/test_script.py
 ```
 
-This direct command creates an ignored root-level `generated/` directory containing:
+This direct command creates a `generated/` directory containing:
 
 - the complete pipeline JSON output;
 - an ECG preprocessing plot comparing the raw noisy signal with the digitally filtered signal (BioSPPy 0.67–45 Hz FIR band-pass and DC-offset removal);
