@@ -14,7 +14,7 @@ This repository provides a reusable implementation of the ECG ingestion, preproc
 
 The repository covers preprocessing and feature extraction. It does not contain the restricted clinical dataset or the complete statistical and machine-learning analysis used in the publication.
 
-> **RR handling:** This repository uses the **RR-interval exclusion method** applied in the associated *Epilepsy & Behavior* paper. Abnormal RR intervals are removed from HRV estimation, and their bounding detected beats are excluded from morphology estimation. The pipeline does not reconstruct excluded intervals or generate synthetic R-peaks.
+> **RR handling:** This repository uses the **RR-interval exclusion method** applied in the associated paper. Abnormal RR intervals are removed from HRV estimation, and their bounding detected beats are excluded from morphology estimation. The pipeline does not reconstruct excluded intervals or generate synthetic R-peaks.
 
 ---
 
