@@ -71,13 +71,9 @@ The diagnostic figure shows both the physiological limits and the RR limits corr
 median(RR) ± mad_threshold × MAD(RR) / 0.6745
 ```
 
-This **exclusion method is the method used in the associated paper and the only RR-gap method implemented by the pipeline**. For morphology estimation, both detected R-peaks bounding an excluded RR interval are omitted from waveform delineation. For HRV estimation, only retained RR values are passed to NeuroKit2 and the custom entropy/complexity calculations. No synthetic RR values or beat timestamps are generated.
+For morphology estimation, both detected R-peaks bounding an excluded RR interval are omitted from waveform delineation. For HRV estimation, only retained RR values are passed to NeuroKit2 and the custom entropy/complexity calculations. No synthetic RR values or beat timestamps are generated.
 
-### Gaps in the retained RR series
-
-The diagnostic plot preserves the original recording time and leaves blank gaps where RR intervals were excluded. For calculation, however, the retained RR values are concatenated into one array, matching the paper's workflow. Consequently, the last retained RR value before an excluded region and the first retained value after it are treated as adjacent observations. This artificial adjacency can influence successive-difference measures such as RMSSD and SDSD, nonlinear measures, entropy measures, and interpolated frequency-domain features. MeanNN, MinNN, and MaxNN depend only on the retained values and are not affected by that adjacency.
-
-Interpolation is applied only where a uniformly sampled RR tachogram is required for a particular HRV calculation:
+Interpolation is applied only where a uniformly sampled RR interval is required for a particular HRV calculation:
 
 | Feature group | RR-series processing |
 |---|---|
