@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.py[cod]
+
+# Clinical recordings and generated outputs must remain outside version control.
+data/
+outputs/
+plots/
+*.edf
+*.EDF
+*.fif
+*.fif.gz
+*_ECG_features.json
+
+# Local files created by the directly executed synthetic demonstration.
+generated/

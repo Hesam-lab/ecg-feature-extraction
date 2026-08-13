@@ -1,22 +1,31 @@
+"""ECG feature-extraction pipeline with R-peak quality-control diagnostics."""
+
 import argparse
 import json
 import logging
 import math
 from collections import defaultdict
+from fractions import Fraction
 from pathlib import Path
 import matplotlib.pyplot as plt
 import mne
 import neurokit2 as nk
 import numpy as np
 import scipy.interpolate
-from scipy.signal import resample
+from scipy.signal import resample_poly
 from tqdm import tqdm
 
+
+__version__ = "3.4.0"
 
 mne.set_log_level("ERROR")
 
 FS = 256
 MIN_RPEAKS = 50
+MAD_THRESHOLD = 3.5
+MAD_SCALE = 0.6745
+MIN_RR_MS = 300.0
+MAX_RR_MS = 2000.0
 
 logger = logging.getLogger(__name__)
 
@@ -62,18 +71,20 @@ def get_ecg_channel(raw):
 
 
 def clean_ecg(raw, fs=FS):
-    """
-    Extract and clean ECG.
+    """Extract, resample, and clean ECG."""
+    if fs <= 0:
+        raise ValueError("Target sampling frequency must be positive.")
 
-    """
     ecg_channel = get_ecg_channel(raw)
     ecg = raw.get_data(picks=[ecg_channel]).flatten()
 
-    original_fs = raw.info["sfreq"]
+    original_fs = float(raw.info["sfreq"])
+    if original_fs <= 0:
+        raise ValueError("Recording sampling frequency must be positive.")
 
     if not np.isclose(original_fs, fs):
-        n_samples = int(round(len(ecg) * fs / original_fs))
-        ecg = resample(ecg, n_samples)
+        ratio = Fraction(float(fs) / original_fs).limit_denominator(1000)
+        ecg = resample_poly(ecg, up=ratio.numerator, down=ratio.denominator)
 
     ecg_clean = nk.ecg_clean(ecg, sampling_rate=fs, method="biosppy")
 
@@ -82,6 +93,11 @@ def clean_ecg(raw, fs=FS):
         "original_fs": float(original_fs),
         "target_fs": fs,
         "n_samples": len(ecg_clean),
+        "cleaning_method": "neurokit2_biosppy",
+        "digital_filter": "FIR band-pass",
+        "passband_hz": [0.67, 45.0],
+        "filter_order": int(1.5 * fs) + (1 - int(1.5 * fs) % 2),
+        "dc_offset_removed": True,
     }
 
     return ecg_clean, ecg, info
@@ -101,55 +117,159 @@ def detect_rpeaks(ecg_clean, fs=FS):
     return rpeaks
 
 
-def remove_bad_rpeaks(rpeaks, fs=FS, mad_threshold=3.0, min_rr_ms=300, max_rr_ms=2000):
-    """
-    Remove unlikely R-peaks based on RR intervals.
-
-    """
-    r = np.asarray(rpeaks["ECG_R_Peaks"], dtype=int)
-
-    if len(r) < 3:
-        return rpeaks, {
-            "n_rpeaks_before": len(r),
-            "n_rpeaks_after": len(r),
-            "removed_percentage": 0.0,
+def _rr_summary(rr_ms):
+    """Summarise RR interval values for quality-control reporting."""
+    rr_ms = np.asarray(rr_ms, dtype=float)
+    if len(rr_ms) == 0:
+        return {
+            "minimum_ms": None,
+            "median_ms": None,
+            "maximum_ms": None,
         }
 
-    rr_ms = np.diff(r) / fs * 1000
-
-    median_rr = np.median(rr_ms)
-    mad_rr = np.median(np.abs(rr_ms - median_rr))
-
-    if mad_rr == 0:
-        mad_outliers = np.zeros(len(rr_ms), dtype=bool)
-    else:
-        mad_outliers = np.abs(rr_ms - median_rr) / mad_rr > mad_threshold
-
-    physiological_outliers = (rr_ms < min_rr_ms) | (rr_ms > max_rr_ms)
-    bad_rr = mad_outliers | physiological_outliers
-
-    # For each bad interval, remove the second R-peak.
-    bad_peak_positions = np.where(bad_rr)[0] + 1
-    bad_peak_positions = np.unique(bad_peak_positions)
-
-    keep = np.ones(len(r), dtype=bool)
-    keep[bad_peak_positions] = False
-
-    r_clean = r[keep]
-
-    report = {
-        "n_rpeaks_before": int(len(r)),
-        "n_rpeaks_after": int(len(r_clean)),
-        "n_removed_rpeaks": int(len(bad_peak_positions)),
-        "removed_percentage": float(len(bad_peak_positions) / len(r) * 100),
-        "median_rr_ms": float(median_rr),
-        "mad_rr_ms": float(mad_rr),
+    return {
+        "minimum_ms": float(np.min(rr_ms)),
+        "median_ms": float(np.median(rr_ms)),
+        "maximum_ms": float(np.max(rr_ms)),
     }
 
-    rpeaks_clean = dict(rpeaks)
-    rpeaks_clean["ECG_R_Peaks"] = r_clean
 
-    return rpeaks_clean, report
+def exclude_abnormal_rr_intervals(
+    rpeaks,
+    fs=FS,
+    mad_threshold=MAD_THRESHOLD,
+    min_rr_ms=MIN_RR_MS,
+    max_rr_ms=MAX_RR_MS,
+):
+    """Identify and exclude abnormal RR intervals without changing R-peaks.
+
+    R-peaks detected by the Nabian et al method are preserved exactly. An RR
+    interval is rejected if it violates the physiological limits or if its
+    modified MAD z-score exceeds ``mad_threshold``. Beats bounding rejected
+    intervals are excluded from morphology analysis, while the retained RR
+    observations are supplied directly to HRV analysis. No peak is inserted,
+    removed, or moved.
+    """
+    if fs <= 0:
+        raise ValueError("Sampling frequency must be positive.")
+    if mad_threshold <= 0:
+        raise ValueError("mad_threshold must be positive.")
+    if min_rr_ms <= 0 or max_rr_ms <= 0:
+        raise ValueError("RR interval limits must be positive.")
+    if min_rr_ms >= max_rr_ms:
+        raise ValueError("min_rr_ms must be smaller than max_rr_ms.")
+
+    detected = np.asarray(rpeaks["ECG_R_Peaks"], dtype=int)
+    if len(detected) < 2:
+        raise ValueError("At least two detected R-peaks are required.")
+    if np.any(np.diff(detected) <= 0):
+        raise ValueError("Detected R-peaks must be strictly increasing.")
+
+    rr_ms = np.diff(detected) / fs * 1000
+    rr_time_sec = detected[1:] / fs
+    median_rr_ms = float(np.median(rr_ms))
+    mad_rr_ms = float(np.median(np.abs(rr_ms - median_rr_ms)))
+
+    if np.isclose(mad_rr_ms, 0):
+        mad_scores = np.zeros(len(rr_ms), dtype=float)
+        mad_outliers = np.zeros(len(rr_ms), dtype=bool)
+        mad_lower_rr_ms = None
+        mad_upper_rr_ms = None
+    else:
+        mad_scores = (
+            MAD_SCALE * np.abs(rr_ms - median_rr_ms) / mad_rr_ms
+        )
+        mad_outliers = mad_scores > mad_threshold
+        mad_limit_delta_ms = mad_threshold * mad_rr_ms / MAD_SCALE
+        mad_lower_rr_ms = median_rr_ms - mad_limit_delta_ms
+        mad_upper_rr_ms = median_rr_ms + mad_limit_delta_ms
+
+    short_intervals = rr_ms < min_rr_ms
+    long_intervals = rr_ms > max_rr_ms
+    excluded_mask = mad_outliers | short_intervals | long_intervals
+    retained_mask = ~excluded_mask
+
+    morphology_peak_mask = np.ones(len(detected), dtype=bool)
+    excluded_indices = np.flatnonzero(excluded_mask)
+    morphology_peak_mask[excluded_indices] = False
+    morphology_peak_mask[excluded_indices + 1] = False
+
+    retained_rr_ms = rr_ms[retained_mask]
+    retained_rr_time_sec = rr_time_sec[retained_mask]
+    morphology_peaks = detected[morphology_peak_mask]
+
+    excluded_intervals = []
+    for interval_index in excluded_indices:
+        reasons = []
+        if short_intervals[interval_index]:
+            reasons.append("below_minimum")
+        if long_intervals[interval_index]:
+            reasons.append("above_maximum")
+        if mad_outliers[interval_index]:
+            reasons.append("mad_outlier")
+
+        excluded_intervals.append({
+            "interval_index": int(interval_index),
+            "start_peak_sample": int(detected[interval_index]),
+            "end_peak_sample": int(detected[interval_index + 1]),
+            "start_time_sec": float(detected[interval_index] / fs),
+            "end_time_sec": float(detected[interval_index + 1] / fs),
+            "rr_ms": float(rr_ms[interval_index]),
+            "mad_score": float(mad_scores[interval_index]),
+            "reasons": reasons,
+        })
+
+    report = {
+        "method": "abnormal_rr_interval_exclusion",
+        "rpeak_detector": "nabian2018",
+        "rpeaks_modified": False,
+        "mad_threshold": float(mad_threshold),
+        "mad_score_definition": f"{MAD_SCALE} * abs(RR - median_RR) / MAD",
+        "minimum_rr_ms": float(min_rr_ms),
+        "maximum_rr_ms": float(max_rr_ms),
+        "median_rr_ms": median_rr_ms,
+        "mad_rr_ms": mad_rr_ms,
+        "mad_lower_rr_ms": mad_lower_rr_ms,
+        "mad_upper_rr_ms": mad_upper_rr_ms,
+        "n_rpeaks_detected": int(len(detected)),
+        "n_morphology_peaks_retained": int(len(morphology_peaks)),
+        "n_rr_intervals_before": int(len(rr_ms)),
+        "n_rr_intervals_retained": int(len(retained_rr_ms)),
+        "n_rr_intervals_excluded": int(np.sum(excluded_mask)),
+        "n_mad_outliers": int(np.sum(mad_outliers)),
+        "n_short_intervals": int(np.sum(short_intervals)),
+        "n_long_intervals": int(np.sum(long_intervals)),
+        "excluded_percentage": float(np.mean(excluded_mask) * 100),
+        "excluded_duration_sec": float(np.sum(rr_ms[excluded_mask]) / 1000),
+        "excluded_interval_indices": excluded_indices.tolist(),
+        "excluded_intervals": excluded_intervals,
+        "excluded_morphology_peak_samples": detected[~morphology_peak_mask].tolist(),
+        "rr_before": _rr_summary(rr_ms),
+        "rr_retained": _rr_summary(retained_rr_ms),
+        "retained_rr_handling": "concatenated_after_exclusion",
+        "retained_rr_caveat": (
+            "The last retained RR value before an excluded region and the "
+            "first retained RR value after it are treated as adjacent for "
+            "successive-difference, nonlinear, and interpolated HRV metrics."
+        ),
+    }
+
+    morphology_rpeaks = dict(rpeaks)
+    morphology_rpeaks["ECG_R_Peaks"] = morphology_peaks
+    morphology_rpeaks["sampling_rate"] = fs
+
+    exclusion_result = {
+        "detected_rpeaks": detected,
+        "rr_ms": rr_ms,
+        "rr_time_sec": rr_time_sec,
+        "retained_mask": retained_mask,
+        "retained_rr_ms": retained_rr_ms,
+        "retained_rr_time_sec": retained_rr_time_sec,
+        "morphology_peak_mask": morphology_peak_mask,
+        "morphology_rpeaks": morphology_rpeaks,
+    }
+
+    return exclusion_result, report
 
 
 def valid_index(x, n):
@@ -323,9 +443,10 @@ def get_df_value(df, col):
         return np.nan
 
 
-def extract_hrv(rpeaks, fs=FS):
-    """Extract time, frequency and nonlinear HRV features."""
-    r = np.asarray(rpeaks["ECG_R_Peaks"], dtype=int)
+def extract_hrv(rr_intervals_ms, fs=FS):
+    """Extract HRV features from the RR series selected for analysis."""
+    rr_ms = np.asarray(rr_intervals_ms, dtype=float)
+    rr_ms = rr_ms[np.isfinite(rr_ms) & (rr_ms > 0)]
 
     features = {
         "MeanNN": np.nan,
@@ -361,15 +482,20 @@ def extract_hrv(rpeaks, fs=FS):
     for kmax in [5, 10, 20]:
         features[f"HFD_k{kmax}"] = np.nan
 
-    if len(r) < 4:
+    if len(rr_ms) < 3:
         return features
 
-    peaks = {"ECG_R_Peaks": r}
-    rr = np.diff(r) / fs
+    # Passing retained RRI values directly prevents NeuroKit2 from
+    # reconstructing or modifying the detected R-peak locations.
+    hrv_input = {
+        "RRI": rr_ms,
+        "sampling_rate": fs,
+    }
+    rr = rr_ms / 1000
     rr_std = np.std(rr)
 
     try:
-        hrv_time = nk.hrv_time(peaks, sampling_rate=fs, show=False)
+        hrv_time = nk.hrv_time(hrv_input, sampling_rate=fs, show=False)
 
         features["MeanNN"] = get_df_value(hrv_time, "HRV_MeanNN")
         features["SDNN"] = get_df_value(hrv_time, "HRV_SDNN")
@@ -383,7 +509,7 @@ def extract_hrv(rpeaks, fs=FS):
 
     try:
         hrv_freq = nk.hrv_frequency(
-            peaks,
+            hrv_input,
             sampling_rate=fs,
             interpolation_rate=4,
             psd_method="welch",
@@ -399,7 +525,7 @@ def extract_hrv(rpeaks, fs=FS):
         logger.warning("Frequency-domain HRV failed: %s", e)
 
     try:
-        hrv_non = nk.hrv_nonlinear(peaks, sampling_rate=fs, show=False)
+        hrv_non = nk.hrv_nonlinear(hrv_input, sampling_rate=fs, show=False)
 
         features["SD1"] = get_df_value(hrv_non, "HRV_SD1")
         features["SD2"] = get_df_value(hrv_non, "HRV_SD2")
@@ -531,8 +657,8 @@ def interpolate_rr(rr, target_fs=4):
         return None
 
 
-def plot_ecg(raw_ecg, clean_ecg, fs, file_name, output_dir):
-    """Save a quick plot of raw and cleaned ECG."""
+def plot_ecg_preprocessing(raw_ecg, clean_ecg, fs, file_name, output_dir):
+    """Plot the noisy input ECG and digitally filtered ECG."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -540,17 +666,196 @@ def plot_ecg(raw_ecg, clean_ecg, fs, file_name, output_dir):
     t = np.arange(n) / fs
 
     plt.figure(figsize=(12, 5))
-    plt.plot(t, raw_ecg[:n] * 1e6, label="Raw ECG", alpha=0.6)
-    plt.plot(t, clean_ecg[:n] * 1e6, label="Cleaned ECG", alpha=0.8)
+    plt.plot(t, raw_ecg[:n] * 1e6, label="Raw noisy ECG", alpha=0.6)
+    plt.plot(
+        t,
+        clean_ecg[:n] * 1e6,
+        label="Digitally filtered ECG (0.67–45 Hz FIR; DC removed)",
+        alpha=0.8,
+    )
     plt.xlabel("Time (s)")
     plt.ylabel("Amplitude (µV)")
-    plt.title("Raw and cleaned ECG")
+    plt.title("ECG preprocessing")
     plt.legend()
     plt.tight_layout()
 
-    out_file = output_dir / f"{Path(file_name).stem}_ecg.png"
+    out_file = output_dir / f"{Path(file_name).stem}_ecg_preprocessing.png"
     plt.savefig(out_file, dpi=300)
     plt.close()
+
+
+def plot_feature_input_after_rr_exclusion(
+    clean_ecg,
+    rr_exclusion,
+    report,
+    fs,
+    file_name,
+    output_dir,
+):
+    """Plot excluded observations and the retained HRV RR-series input."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    signal = np.asarray(clean_ecg, dtype=float)
+    detected = np.asarray(rr_exclusion["detected_rpeaks"], dtype=int)
+    retained_rr_mask = np.asarray(rr_exclusion["retained_mask"], dtype=bool)
+    morphology_peak_mask = np.asarray(
+        rr_exclusion["morphology_peak_mask"],
+        dtype=bool,
+    )
+    rr_ms = np.asarray(rr_exclusion["rr_ms"], dtype=float)
+    rr_time_sec = np.asarray(rr_exclusion["rr_time_sec"], dtype=float)
+    excluded_indices = np.flatnonzero(~retained_rr_mask)
+    recording_duration_sec = len(signal) / fs
+    start = 0
+    stop = len(signal)
+    time = np.arange(start, stop) / fs
+    visible_mask = (detected >= start) & (detected < stop)
+    retained_visible = detected[visible_mask & morphology_peak_mask]
+    excluded_visible = detected[visible_mask & ~morphology_peak_mask]
+
+    fig, axes = plt.subplots(3, 1, figsize=(13, 11))
+
+    axes[0].plot(time, signal[start:stop] * 1e6, color="0.35", linewidth=1)
+    for position, interval_index in enumerate(excluded_indices):
+        interval_start = detected[interval_index] / fs
+        interval_end = detected[interval_index + 1] / fs
+        if interval_end < start / fs or interval_start > stop / fs:
+            continue
+        axes[0].axvspan(
+            interval_start,
+            interval_end,
+            color="#E45756",
+            alpha=0.14,
+            label="Excluded RR segment" if position == 0 else None,
+        )
+
+    axes[0].scatter(
+        retained_visible / fs,
+        signal[retained_visible] * 1e6,
+        marker="o",
+        facecolors="none",
+        edgecolors="#2CA02C",
+        s=48,
+        label="Detected peak retained for morphology",
+        zorder=3,
+    )
+    axes[0].scatter(
+        excluded_visible / fs,
+        signal[excluded_visible] * 1e6,
+        marker="x",
+        color="#E45756",
+        s=50,
+        label="Detected peak excluded from morphology",
+        zorder=4,
+    )
+    axes[0].set_title("Nabian R-peaks and ECG segments excluded from analysis")
+    axes[0].set_xlabel("Time (s)")
+    axes[0].set_ylabel("Amplitude (µV)")
+    axes[0].set_xlim(0, recording_duration_sec)
+    axes[0].legend(loc="upper right")
+    axes[0].grid(alpha=0.2)
+
+    axes[1].plot(
+        rr_time_sec,
+        rr_ms,
+        "o-",
+        color="0.55",
+        markersize=3,
+        linewidth=1,
+        label="All detected RR intervals",
+    )
+    axes[1].scatter(
+        rr_time_sec[retained_rr_mask],
+        rr_ms[retained_rr_mask],
+        color="#2CA02C",
+        s=24,
+        label="Retained",
+        zorder=3,
+    )
+    axes[1].scatter(
+        rr_time_sec[~retained_rr_mask],
+        rr_ms[~retained_rr_mask],
+        color="#E45756",
+        marker="x",
+        s=55,
+        label="Excluded",
+        zorder=4,
+    )
+    axes[1].axhline(
+        report["minimum_rr_ms"],
+        color="0.35",
+        linestyle="--",
+        linewidth=1,
+        label=(
+            f"Physiological limits ({report['minimum_rr_ms']:g}–"
+            f"{report['maximum_rr_ms']:g} ms)"
+        ),
+    )
+    axes[1].axhline(
+        report["maximum_rr_ms"],
+        color="0.35",
+        linestyle="--",
+        linewidth=1,
+    )
+    if report["mad_lower_rr_ms"] is not None:
+        axes[1].axhline(
+            report["mad_lower_rr_ms"],
+            color="#4C78A8",
+            linestyle="-.",
+            linewidth=1.2,
+            label=(
+                "MAD limits "
+                f"({report['mad_lower_rr_ms']:.1f}–"
+                f"{report['mad_upper_rr_ms']:.1f} ms; "
+                f"threshold {report['mad_threshold']:g})"
+            ),
+        )
+        axes[1].axhline(
+            report["mad_upper_rr_ms"],
+            color="#4C78A8",
+            linestyle="-.",
+            linewidth=1.2,
+        )
+    axes[1].set_title("RR-interval series before exclusion")
+    axes[1].set_xlabel("Time of second detected R-peak (s)")
+    axes[1].set_ylabel("RR interval (ms)")
+    axes[1].set_xlim(0, recording_duration_sec)
+    axes[1].legend(loc="best")
+    axes[1].grid(alpha=0.2)
+
+    retained_rr_plot = np.where(retained_rr_mask, rr_ms, np.nan)
+    axes[2].plot(
+        rr_time_sec,
+        retained_rr_plot,
+        "o-",
+        color="#2CA02C",
+        markersize=3,
+        linewidth=1,
+        label="Retained RR used for HRV",
+    )
+    axes[2].set_title(
+        "RR values used for HRV estimation "
+        f"({report['n_rr_intervals_excluded']} excluded; gaps left blank)"
+    )
+    axes[2].legend(loc="best")
+    axes[2].set_xlabel("Time of second detected R-peak (s)")
+    axes[2].set_ylabel("RR interval (ms)")
+    axes[2].set_xlim(0, recording_duration_sec)
+    axes[2].grid(alpha=0.2)
+
+    fig.suptitle(
+        f"Feature-estimation input after RR-interval exclusion: {file_name}",
+        fontsize=14,
+    )
+    fig.tight_layout()
+
+    out_file = (
+        output_dir
+        / f"{Path(file_name).stem}_feature_input_after_rr_exclusion.png"
+    )
+    fig.savefig(out_file, dpi=200, bbox_inches="tight")
+    plt.close(fig)
 
 
 def parse_condition(file_name):
@@ -588,12 +893,12 @@ def get_patient_id(file_name):
 
 def get_data_files(input_dir):
     input_dir = Path(input_dir)
+    supported_suffixes = (".edf", ".fif", ".fif.gz")
     return sorted(
-        list(input_dir.glob("*.edf")) +
-        list(input_dir.glob("*.EDF")) +
-        list(input_dir.glob("*.fif")) +
-        list(input_dir.glob("*.fif.gz"))
+        path for path in input_dir.iterdir()
+        if path.is_file() and path.name.lower().endswith(supported_suffixes)
     )
+
 
 def load_raw_file(file_path):
     file_path = Path(file_path)
@@ -607,6 +912,7 @@ def load_raw_file(file_path):
 
     raise ValueError(f"Unsupported file type: {file_path}")
 
+
 def group_by_patient(files):
     patient_files = defaultdict(list)
 
@@ -617,43 +923,83 @@ def group_by_patient(files):
     return patient_files
 
 
-def patient_has_required_files(files):
-    conditions = {parse_condition(f.name) for f in files}
-    conditions.discard(None)
-
-    has_interictal = "interictal" in conditions
-    has_event = any(c in conditions for c in ["preictal", "ictal", "postictal"])
-
-    return has_interictal and has_event
-
-
-def process_file(file_path, fs=FS, save_plot=False, plot_dir=None):
+def process_file(
+    file_path,
+    fs=FS,
+    min_rpeaks=MIN_RPEAKS,
+    mad_threshold=MAD_THRESHOLD,
+    min_rr_ms=MIN_RR_MS,
+    max_rr_ms=MAX_RR_MS,
+    save_plot=False,
+    plot_dir=None,
+):
     """Process one FIF/EDF file and return ECG features."""
     raw = load_raw_file(file_path)
 
     ecg_clean, ecg_raw, clean_info = clean_ecg(raw, fs=fs)
 
     if save_plot and plot_dir is not None:
-        plot_ecg(ecg_raw, ecg_clean, fs, file_path.name, plot_dir)
+        plot_ecg_preprocessing(
+            ecg_raw,
+            ecg_clean,
+            fs,
+            file_path.name,
+            plot_dir,
+        )
 
-    rpeaks = detect_rpeaks(ecg_clean, fs=fs)
-    rpeaks, rpeak_report = remove_bad_rpeaks(rpeaks, fs=fs)
+    detected_rpeaks = detect_rpeaks(ecg_clean, fs=fs)
+    rr_exclusion, rr_exclusion_report = exclude_abnormal_rr_intervals(
+        detected_rpeaks,
+        fs=fs,
+        mad_threshold=mad_threshold,
+        min_rr_ms=min_rr_ms,
+        max_rr_ms=max_rr_ms,
+    )
+    if save_plot and plot_dir is not None:
+        plot_feature_input_after_rr_exclusion(
+            ecg_clean,
+            rr_exclusion,
+            rr_exclusion_report,
+            fs,
+            file_path.name,
+            plot_dir,
+        )
 
-    n_rpeaks = len(rpeaks["ECG_R_Peaks"])
+    n_rpeaks = len(rr_exclusion["detected_rpeaks"])
+    n_retained_rr = len(rr_exclusion["retained_rr_ms"])
+    n_morphology_rpeaks = len(
+        rr_exclusion["morphology_rpeaks"]["ECG_R_Peaks"]
+    )
 
-    if n_rpeaks < MIN_RPEAKS:
-        raise ValueError(f"Too few R-peaks detected: {n_rpeaks}")
+    if n_rpeaks < min_rpeaks:
+        raise ValueError(
+            f"Too few R-peaks detected: {n_rpeaks} "
+            f"(minimum required: {min_rpeaks})"
+        )
+    if n_retained_rr < min_rpeaks - 1:
+        raise ValueError(
+            f"Too few RR intervals retained after exclusion: {n_retained_rr} "
+            f"(minimum required: {min_rpeaks - 1})"
+        )
 
-    morphology = extract_morphology(ecg_clean, rpeaks, fs=fs)
-    hrv = extract_hrv(rpeaks, fs=fs)
+    morphology = extract_morphology(
+        ecg_clean,
+        rr_exclusion["morphology_rpeaks"],
+        fs=fs,
+    )
+    hrv = extract_hrv(rr_exclusion["retained_rr_ms"], fs=fs)
 
     features = {
+        "pipeline_version": __version__,
         "file_name": file_path.name,
         "duration_sec": len(ecg_clean) / fs,
         "sampling_rate": fs,
-        "num_rpeaks": n_rpeaks,
+        "num_rpeaks_detected": n_rpeaks,
+        "num_rr_intervals_retained": n_retained_rr,
+        "num_rr_intervals_used_for_hrv": n_retained_rr,
+        "num_morphology_rpeaks_retained": n_morphology_rpeaks,
         "cleaning": clean_info,
-        "rpeak_filtering": rpeak_report,
+        "rr_interval_exclusion": rr_exclusion_report,
         "morphology": morphology,
         "hrv": hrv,
     }
@@ -661,16 +1007,47 @@ def process_file(file_path, fs=FS, save_plot=False, plot_dir=None):
     return features
 
 
-def process_data(input_dir, output_dir, fs=FS, save_plots=False):
+def process_data(
+    input_dir,
+    output_dir,
+    fs=FS,
+    min_rpeaks=MIN_RPEAKS,
+    mad_threshold=MAD_THRESHOLD,
+    min_rr_ms=MIN_RR_MS,
+    max_rr_ms=MAX_RR_MS,
+    save_plots=False,
+):
     input_dir = Path(input_dir)
     output_dir = Path(output_dir)
+
+    if fs <= 0:
+        raise ValueError("Target sampling frequency must be positive.")
+    if min_rpeaks < 4:
+        raise ValueError("min_rpeaks must be at least 4.")
+    if mad_threshold <= 0:
+        raise ValueError("mad_threshold must be positive.")
+    if min_rr_ms <= 0 or max_rr_ms <= 0 or min_rr_ms >= max_rr_ms:
+        raise ValueError(
+            "RR interval limits must be positive and min_rr_ms must be "
+            "smaller than max_rr_ms."
+        )
+    if not input_dir.exists():
+        raise FileNotFoundError(f"Input directory does not exist: {input_dir}")
+    if not input_dir.is_dir():
+        raise NotADirectoryError(f"Input path is not a directory: {input_dir}")
+
     output_dir.mkdir(parents=True, exist_ok=True)
 
     plot_dir = output_dir / "plots" if save_plots else None
 
     data_files = get_data_files(input_dir)
+    if len(data_files) == 0:
+        raise FileNotFoundError(
+            f"No EDF or FIF recordings found in input directory: {input_dir}"
+        )
+
     logger.info("Found %d EDF/FIF files", len(data_files))
-    
+
     patient_files = group_by_patient(data_files)
 
     logger.info("Found %d patients", len(patient_files))
@@ -689,6 +1066,10 @@ def process_data(input_dir, output_dir, fs=FS, save_plots=False):
                 features = process_file(
                     file_path,
                     fs=fs,
+                    min_rpeaks=min_rpeaks,
+                    mad_threshold=mad_threshold,
+                    min_rr_ms=min_rr_ms,
+                    max_rr_ms=max_rr_ms,
                     save_plot=save_plots,
                     plot_dir=plot_dir
                 )
@@ -721,13 +1102,19 @@ def process_data(input_dir, output_dir, fs=FS, save_plots=False):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Extract ECG morphology and HRV features from FIF files."
+        description="Extract ECG morphology and HRV features from EDF/FIF recordings."
+    )
+
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
     )
 
     parser.add_argument(
         "--input_dir",
         required=True,
-        help="Folder containing FIF files."
+        help="Folder containing EDF or FIF recordings."
     )
 
     parser.add_argument(
@@ -746,7 +1133,41 @@ def main():
     parser.add_argument(
         "--save_plots",
         action="store_true",
-        help="Save raw/cleaned ECG plots."
+        help="Save ECG and RR-interval quality-control plots."
+    )
+
+    parser.add_argument(
+        "--min_rpeaks",
+        type=int,
+        default=MIN_RPEAKS,
+        help=(
+            "Minimum detected R-peak count and corresponding retained RR "
+            f"count. Default is {MIN_RPEAKS}."
+        ),
+    )
+
+    parser.add_argument(
+        "--mad_threshold",
+        type=float,
+        default=MAD_THRESHOLD,
+        help=(
+            "Exclude RR intervals whose modified MAD z-score exceeds this "
+            f"value. Default is {MAD_THRESHOLD:g}."
+        ),
+    )
+
+    parser.add_argument(
+        "--min_rr_ms",
+        type=float,
+        default=MIN_RR_MS,
+        help=f"Minimum plausible RR interval in milliseconds. Default is {MIN_RR_MS:g}."
+    )
+
+    parser.add_argument(
+        "--max_rr_ms",
+        type=float,
+        default=MAX_RR_MS,
+        help=f"Maximum plausible RR interval in milliseconds. Default is {MAX_RR_MS:g}."
     )
 
     args = parser.parse_args()
@@ -760,6 +1181,10 @@ def main():
         input_dir=args.input_dir,
         output_dir=args.output_dir,
         fs=args.fs,
+        min_rpeaks=args.min_rpeaks,
+        mad_threshold=args.mad_threshold,
+        min_rr_ms=args.min_rr_ms,
+        max_rr_ms=args.max_rr_ms,
         save_plots=args.save_plots
     )
 
