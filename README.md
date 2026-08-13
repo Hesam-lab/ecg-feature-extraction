@@ -324,3 +324,7 @@ This direct command creates a `generated/` directory containing:
 Alaei, H. (2026). ECG Feature Extraction from EDF/FIF Recordings. GitHub repository:
 https://github.com/Hesam-lab/ecg-feature-extraction
 ```
+
+## License
+
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
