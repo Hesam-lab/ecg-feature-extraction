@@ -28,7 +28,7 @@ The script performs the following steps:
 4. Cleans the ECG signal using NeuroKit2.
 5. Detects R-peaks.
 6. Identifies abnormal RR intervals using MAD and configurable physiological limits.
-7. Excludes abnormal RR observations from HRV estimation using the paper method.
+7. Excludes abnormal RR observations from HRV estimation.
 8. Excludes detected beats bounding rejected intervals from morphology analysis.
 9. Extracts HRV and ECG morphology features from the selected observations.
 10. Saves extracted features as JSON files.
